@@ -107,6 +107,13 @@ If you use code from this repository, please cite:
 
 DOI: [DOI]
 
+Raw sequencing data: GEO accession: GSEXXXXX
+
+Reproducible environment: renv::restore()
+
+Repository DOI: 10.5281/zenodo.xxxxxxx
+
+
 ## License
 
 This repository is distributed under the MIT License.

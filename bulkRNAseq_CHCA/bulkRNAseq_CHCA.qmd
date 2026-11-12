@@ -1,0 +1,493 @@
+---
+title: "bulkRNAseq_CHCA"
+format: html
+editor: source
+---
+
+# Setup
+
+## Load dependencies
+
+```{r}
+library(BiocManager)
+library(tximport)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(DESeq2)
+library(msigdbr)
+library(GSVA)
+library(progeny)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggpubr)
+library(viridis)
+library(here)
+```
+
+## Set seed to improve reproducibility
+
+```{r}
+set.seed(123)
+```
+
+## Create file structure
+
+```{r}
+dirs <- c(
+  "bulkRNAseq_CHCA/data",
+  "bulkRNAseq_CHCA/outs"
+)
+
+lapply(
+  dirs,
+  \(d) dir.create(here(d),
+                  recursive = TRUE,
+                  showWarnings = FALSE)
+)
+```
+
+# Format data objects
+
+## Retrieve RNA-seq files (download "quant.genes.sf" files from GEO#: GSM10180842)
+
+## Add files to bulkRNAseq_CHCA/data directory
+
+```{r}
+# untar the folder
+untar(
+  tarfile = here("bulkRNAseq_CHCA", "data", "GSE353685_RAW.tar"),
+  exdir = here("bulkRNAseq_CHCA", "data")
+)
+
+# create list of files
+files <- list.files(
+  here("bulkRNAseq_CHCA", "data"),
+  pattern = "quant\\.genes\\.sf\\.gz$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+# Extract sample names: A1, A2, B1, C1, etc.
+sample_names <- sub(
+  "^GSM[0-9]+_([^_]+)_.*",
+  "\\1",
+  basename(files)
+)
+names(files) <- sample_names
+
+# Order samples correctly
+sample_order <- c("A1","A2","A3","A4",
+                  "B1","B2","B3","B4",
+                  "C1","C2","C3")
+
+files <- files[match(sample_order, names(files))]
+
+length(files)
+```
+
+## Add sample metadata
+
+```{r}
+sample_table <- data.frame(
+  sample = sample_order,
+  group = c(
+    rep("Young", 4),
+    rep("Aging", 4),
+    rep("CHCA_Aging", 3)
+  )
+)
+
+# designate "group" based on age and treatment
+sample_table$group <- factor(
+  sample_table$group,
+  levels = c("Young", "Aging", "CHCA_Aging")
+)
+
+rownames(sample_table) <- sample_table$sample
+
+all(rownames(sample_table) == names(files))
+```
+
+## Create DEseq2 object
+
+```{r}
+txi <- tximport(
+  files,
+  type = "salmon",
+  txOut = TRUE
+)
+
+dds <- DESeqDataSetFromTximport(
+  txi = txi,
+  colData = sample_table,
+  design = ~ group
+)
+```
+
+# Preprocess data (filter/transform)
+
+## Filter low-expressing genes
+
+```{r}
+cat("Genes before filtering:", nrow(dds), "\n")
+keep <- rowSums(counts(dds) >= 10) >=2 #the gene needs to be expressed in at least 2 samples
+dds <- dds[keep, ]
+cat("Genes after filtering:", nrow(dds), "\n")
+
+# Genes before filtering: 55335 
+# Genes after filtering: 19476 
+
+#Number of genes before/after filtering is expected for bulk RNA-seq. Still good sequencing depth with ~20k final genes.
+```
+
+## Perform variance stabilization transformation
+
+```{r}
+vsd <- vst(dds, blind = FALSE)
+vsd_mat <- assay(vsd)
+```
+
+## Change ENSMBL IDs to gene symbol
+
+```{r}
+# map gene names
+gene_ids <- gsub("\\..*", "", rownames(vsd_mat))
+
+gene_symbols <- mapIds(
+  org.Mm.eg.db,
+  keys = gene_ids,
+  column = "SYMBOL",
+  keytype = "ENSEMBL",
+  multiVals = "asNA"
+)
+
+# assign directly to rownames
+rownames(vsd_mat) <- gene_symbols
+
+# remove ambiguous mapping
+vsd_mat <- vsd_mat[!is.na(rownames(vsd_mat)), ]
+
+# pool duplicates
+vsd_mat <- as.data.frame(vsd_mat) %>%
+  tibble::rownames_to_column("symbol") %>%
+  group_by(symbol) %>%
+  summarise(across(where(is.numeric), mean), .groups = "drop") %>%
+  tibble::column_to_rownames("symbol") %>%
+  as.matrix()
+```
+
+# Explore data
+
+## Slc16ae/MCT4 expression (Figure 6G)
+
+```{r}
+gene_use <- "Slc16a3"
+
+expr_df <- data.frame(
+  sample = colnames(vsd_mat),
+  group = sample_table[colnames(vsd_mat), "group"],
+  Expression = as.numeric(vsd_mat[gene_use, ])
+)
+
+expr_df$group <- factor(
+  expr_df$group,
+  levels = c("Young", "Aging", "CHCA_Aging"),
+  labels = c("Young", "Aging", "Aging\nCHCA-treated")
+)
+
+group_colors <- c(
+  "Young" = "#4C78A8",
+  "Aging" = "#F58518",
+  "Aging\nCHCA-treated" = "#54A24B"
+)
+
+p_G <- ggplot(expr_df, aes(x = group, y = Expression, fill = group)) +
+  geom_boxplot(width = 0.55, alpha = 0.75, outlier.shape = NA,
+               color = "black", linewidth = 0.35) +
+  geom_jitter(aes(color = group), width = 0.12, size = 2.4, alpha = 0.95) +
+  stat_compare_means(
+    comparisons = list(c("Young", "Aging"),
+                       c("Aging", "Aging\nCHCA-treated")),
+    method = "wilcox.test",
+    label = "p.format",
+    size = 3,
+    step.increase = 0.12
+  ) +
+  scale_fill_manual(values = group_colors) +
+  scale_color_manual(values = group_colors) +
+  labs(
+    title = expression(italic(Slc16a3)~"(MCT4)"),
+    x = "",
+    y = "Normalized Expression (VST)"
+  ) +
+  theme_classic(base_size = 12, base_family = "Times New Roman") +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    legend.position = "none"
+  )
+
+p_G
+```
+
+## GO pathways of interest (Figure 6H)
+
+### Download GO pathway genes
+
+```{r}
+msig_go <- msigdbr(
+  species = "Mus musculus",
+  collection = "C5",
+  subcollection = "GO:BP"
+)
+
+pathway_sets <- list(
+  Inflammation = msig_go %>%
+    filter(gs_name == "GOBP_CYTOKINE_PRODUCTION_INVOLVED_IN_INFLAMMATORY_RESPONSE") %>%
+    pull(gene_symbol) %>%
+    unique(),
+  
+  Microglia = msig_go %>%
+    filter(gs_name == "GOBP_MICROGLIAL_CELL_ACTIVATION_INVOLVED_IN_IMMUNE_RESPONSE") %>%
+    pull(gene_symbol) %>%
+    unique()
+)
+
+pathway_sets <- lapply(pathway_sets, function(x) intersect(x, rownames(vsd_mat)))
+```
+
+## Plot pathway variation (GSVA)
+
+```{r}
+gsva_param <- gsvaParam(
+  exprData = as.matrix(vsd_mat),
+  geneSets = pathway_sets,
+  kcdf = "Gaussian"
+)
+
+gsva_scores <- gsva(gsva_param)
+
+gsva_df <- as.data.frame(t(gsva_scores))
+gsva_df$sample <- rownames(gsva_df)
+gsva_df$group <- sample_table[gsva_df$sample, "group"]
+
+gsva_long <- gsva_df %>%
+  pivot_longer(
+    cols = names(pathway_sets),
+    names_to = "Pathway",
+    values_to = "GSVA_score"
+  )
+
+bubble_gsva <- gsva_long %>%
+  group_by(group, Pathway) %>%
+  summarise(
+    mean_score = mean(GSVA_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+bubble_gsva$group <- factor(
+  bubble_gsva$group,
+  levels = c("Young", "Aging", "CHCA_Aging"),
+  labels = c("Young", "Aging", "Aging\nCHCA-treated")
+)
+
+bubble_gsva$Pathway <- factor(
+  bubble_gsva$Pathway,
+  levels = c("Inflammation", "Microglia")
+)
+
+p_H <- ggplot(bubble_gsva, aes(x = group, y = Pathway)) +
+  geom_point(
+    aes(size = abs(mean_score), fill = mean_score),
+    shape = 21,
+    color = "black",
+    stroke = 0.35,
+    alpha = 0.95
+  ) +
+  scale_fill_gradient2(
+    low = "navy",
+    mid = "white",
+    high = "firebrick",
+    midpoint = 0,
+    name = "Mean GSVA score"
+  ) +
+  scale_size_continuous(
+    range = c(2.5, 9),
+    name = "Mean GSVA"
+  ) +
+  theme_classic(base_size = 12, base_family = "Times New Roman") +
+  labs(
+    title = "Mean GSVA",
+    x = "",
+    y = ""
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 11),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(angle = 45, hjust = 1, size = 10),
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 6)
+  )
+
+p_H
+```
+
+# PROGENy signaling pathway activity (Figure 6I)
+
+```{r}
+progeny_scores <- progeny(
+  expr = as.matrix(vsd_mat),
+  scale = TRUE,
+  organism = "Mouse",
+  top = 500
+)
+
+progeny_df <- as.data.frame(progeny_scores)
+progeny_df$sample <- rownames(progeny_df)
+progeny_df$group <- sample_table[progeny_df$sample, "group"]
+
+progeny_long <- progeny_df %>%
+  pivot_longer(
+    cols = -c(sample, group),
+    names_to = "Pathway",
+    values_to = "Activity"
+  )
+
+progeny_bubble <- progeny_long %>%
+  group_by(group, Pathway) %>%
+  summarise(
+    mean_activity = mean(Activity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+progeny_bubble$group <- factor(
+  progeny_bubble$group,
+  levels = c("Young", "Aging", "CHCA_Aging"),
+  labels = c("Young", "Aging", "Aging\nCHCA-treated")
+)
+
+progeny_bubble$Pathway <- dplyr::recode(
+  progeny_bubble$Pathway,
+  "Trail" = "TRAIL",
+  "TNFa" = "TNFα",
+  "TGFb" = "TGFβ",
+  "PI3k" = "PI3K",
+  "P53" = "p53",
+  "NFkB" = "NF-κB"
+)
+
+p_I <- ggplot(progeny_bubble, aes(x = group, y = Pathway)) +
+  geom_point(
+    aes(size = abs(mean_activity), fill = mean_activity),
+    shape = 21,
+    color = "white",
+    stroke = 0.6,
+    alpha = 0.95
+  ) +
+scale_fill_gradient2( #change from viridis and make sure centered on zero to more accurately relect up/down reg
+  low = "navy",
+  mid = "white",
+  high = "firebrick",
+  midpoint = 0
+) +
+  scale_size_continuous(
+    range = c(2.5, 8),
+    name = "Absolute pathway\nactivity"
+  ) +
+  guides(
+    size = guide_legend(
+      override.aes = list(
+        color = "black",
+        fill = "grey85"
+      )
+    )
+  ) +
+  theme_minimal(base_size = 12, base_family = "Times New Roman") +
+  labs(
+    title = "PROGENy-Inferred Signaling Pathway Activity",
+    x = "",
+    y = ""
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7)
+  )
+
+p_I
+```
+
+# Save figures
+
+```{r}
+ggsave(file.path(here("bulkRNAseq_CHCA", "outs"), "Figure6G_Slc16a3_MCT4.png"),
+       p_G, width = 4, height = 4, dpi = 300)
+
+ggsave(file.path(here("bulkRNAseq_CHCA", "outs"), "Figure6H_GSVA_inflammation_microglia.png"),
+       p_H, width = 4.5, height = 4, dpi = 300)
+
+ggsave(file.path(here("bulkRNAseq_CHCA", "outs"), "Figure6I_PROGENy_pathway_activity.png"),
+       p_I, width = 6, height = 6, dpi = 300)
+
+list.files(here("bulkRNAseq_CHCA", "outs"))
+```
+
+```{r}
+sessionInfo()
+
+# R version 4.5.2 (2025-10-31)
+# Platform: x86_64-apple-darwin20
+# Running under: macOS Sonoma 14.7.6
+# 
+# Matrix products: default
+# BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
+# LAPACK: /Library/Frameworks/R.framework/Versions/4.5-x86_64/Resources/lib/libRlapack.dylib;  LAPACK version 3.12.1
+# 
+# locale:
+# [1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+# 
+# time zone: America/St_Johns
+# tzcode source: internal
+# 
+# attached base packages:
+# [1] stats4    stats     graphics  grDevices utils     datasets  methods   base     
+# 
+# other attached packages:
+#  [1] gprofiler2_0.2.4            ggrepel_0.9.8               UpSetR_1.4.1                lubridate_1.9.5             forcats_1.0.1              
+#  [6] stringr_1.6.0               purrr_1.2.2                 readr_2.2.0                 tidyverse_2.0.0             here_1.0.2                 
+# [11] tibble_3.3.1                progeny_1.32.0              GSVA_2.4.9                  org.Mm.eg.db_3.22.0         AnnotationDbi_1.72.0       
+# [16] viridis_0.6.5               viridisLite_0.4.3           msigdbr_26.1.0              ggpubr_0.6.3                ggplot2_4.0.3              
+# [21] tidyr_1.3.2                 dplyr_1.2.1                 DESeq2_1.50.2               SummarizedExperiment_1.40.0 Biobase_2.70.0             
+# [26] MatrixGenerics_1.22.0       matrixStats_1.5.0           GenomicRanges_1.62.1        Seqinfo_1.0.0               IRanges_2.44.0             
+# [31] S4Vectors_0.48.1            BiocGenerics_0.56.0         generics_0.1.4              tximport_1.38.2            
+# 
+# loaded via a namespace (and not attached):
+#   [1] RColorBrewer_1.1-3          rstudioapi_0.18.0           jsonlite_2.0.0              magrittr_2.0.5              magick_2.9.1               
+#   [6] farver_2.1.2                vctrs_0.7.3                 memoise_2.0.1               RCurl_1.98-1.19             rstatix_0.7.3              
+#  [11] htmltools_0.5.9             S4Arrays_1.10.1             curl_7.1.0                  broom_1.0.13                Rhdf5lib_1.32.0            
+#  [16] SparseArray_1.10.10         Formula_1.2-5               rhdf5_2.54.1                htmlwidgets_1.6.4           plyr_1.8.9                 
+#  [21] plotly_4.12.0               cachem_1.1.0                lifecycle_1.0.5             pkgconfig_2.0.3             rsvd_1.0.5                 
+#  [26] Matrix_1.7-5                R6_2.6.1                    fastmap_1.2.0               digest_0.6.39               rprojroot_2.1.1            
+#  [31] irlba_2.3.7                 pkgload_1.5.2               RSQLite_3.53.1              beachmat_2.26.0             labeling_0.4.3             
+#  [36] timechange_0.4.0            httr_1.4.8                  abind_1.4-8                 compiler_4.5.2              bit64_4.8.2                
+#  [41] withr_3.0.2                 S7_0.2.2                    backports_1.5.1             BiocParallel_1.44.0         carData_3.0-6              
+#  [46] DBI_1.3.0                   HDF5Array_1.38.0            ggsignif_0.6.4              DelayedArray_0.36.1         rjson_0.2.23               
+#  [51] tools_4.5.2                 otel_0.2.0                  glue_1.8.1                  h5mread_1.2.1               rhdf5filters_1.22.0        
+#  [56] grid_4.5.2                  reshape2_1.4.5              memuse_4.2-3                gtable_0.3.6                tzdb_0.5.0                 
+#  [61] data.table_1.18.4           hms_1.1.4                   BiocSingular_1.26.1         ScaledMatrix_1.18.0         car_3.1-5                  
+#  [66] XVector_0.50.0              pillar_1.11.1               babelgene_22.9              vroom_1.7.1                 lattice_0.22-9             
+#  [71] bit_4.6.0                   annotate_1.88.0             tidyselect_1.2.1            SingleCellExperiment_1.32.0 locfit_1.5-9.12            
+#  [76] Biostrings_2.78.0           knitr_1.51                  gridExtra_2.3               xfun_0.58                   stringi_1.8.7              
+#  [81] lazyeval_0.2.3              evaluate_1.0.5              codetools_0.2-20            BiocManager_1.30.27         graph_1.88.1               
+#  [86] cli_3.6.6                   xtable_1.8-8                Rcpp_1.1.1-1.1              png_0.1-9                   XML_3.99-0.23              
+#  [91] parallel_4.5.2              assertthat_0.2.1            blob_1.3.0                  bitops_1.0-9                sparseMatrixStats_1.22.0   
+#  [96] SpatialExperiment_1.20.0    GSEABase_1.72.0             scales_1.4.0                crayon_1.5.3                rlang_1.2.0                
+# [101] KEGGREST_1.50.0      
+```

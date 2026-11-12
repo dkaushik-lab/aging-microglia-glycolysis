@@ -1,0 +1,2465 @@
+---
+title: "Amin_scRNAseq_TA"
+format: html
+editor: source
+---
+
+# Setup
+
+## Load dependencies
+
+```{r}
+library(here)
+library(Seurat)
+library(data.table)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(grid)
+library(msigdbr)
+library(viridis)
+library(ggbeeswarm)
+library(pheatmap)
+library(ggrepel)
+library(GEOquery)
+```
+
+## set seed to improve reproducability
+
+```{r}
+set.seed(123)
+```
+
+## Create file structure
+
+```{r}
+dirs <- c(
+  "scRNAseq_MS/data/raw",
+  "scRNAseq_MS/data/processed",
+  "scRNAseq_MS/outs"
+)
+
+lapply(
+  dirs,
+  \(d) dir.create(here(d),
+                  recursive = TRUE,
+                  showWarnings = FALSE)
+)
+```
+
+# Compile data into Seurat object
+
+## Load files from GEO (#GSE180759)
+
+```{r}
+getGEOSuppFiles(
+  "GSE180759",
+  baseDir = "data/raw"
+)
+
+list.files(
+  "data/raw/GSE180759",
+  recursive = TRUE,
+  full.names = TRUE
+)
+```
+
+## Pull in expression/metadata information
+
+```{r}
+expr <- fread(here("scRNAseq_MS", "data", "raw", "GSE180759", "GSE180759_expression_matrix.csv.gz"))
+meta <- fread(here("scRNAseq_MS", "data", "raw", "GSE180759", "GSE180759_annotation.txt.gz"))
+
+dim(expr)
+dim(meta)
+colnames(meta)
+head(meta)
+```
+
+## Prepare expression matrix
+
+```{r}
+mem.maxVSize(32768)
+
+expr <- as.data.frame(expr)
+
+gene_names <- expr$V1
+expr$V1 <- NULL
+expr <- as.matrix(expr)
+rownames(expr) <- gene_names
+head(rownames(expr))
+
+expr <- as.matrix(expr)
+expr <- Matrix(expr, sparse = TRUE)
+
+dim(expr)
+expr[1:5, 1:5]
+```
+
+## Prepare metadata
+
+```{r}
+meta <- as.data.frame(meta)
+
+rownames(meta) <- meta$nucleus_barcode
+
+head(meta)
+colnames(meta)
+```
+
+## Match expression matrix and metadata
+
+```{r}
+common_cells <- intersect(colnames(expr), rownames(meta))
+
+expr <- expr[, common_cells]
+meta <- meta[common_cells, ]
+
+all(colnames(expr) == rownames(meta))
+length(common_cells)
+```
+
+## Create Seurat object
+
+```{r}
+obj <- CreateSeuratObject(
+  counts = expr,
+  meta.data = meta,
+  min.cells = 3,
+  min.features = 100,
+  project = "GSE180759_MS_brain"
+)
+
+obj
+```
+
+## Standardize metadata variables
+
+```{r}
+colnames(obj@meta.data)
+
+#collapse MS samples into a single group
+obj$group <- ifelse(
+  grepl("control", obj$pathology, ignore.case = TRUE),
+  "Control",
+  "MS"
+)
+
+obj$group <- factor(obj$group, levels = c("Control", "MS")) #ensure stored as factor
+
+#rename some columns
+colnames(obj@meta.data) <- dplyr::recode(
+  colnames(obj@meta.data),
+  NBB_case = "donor",
+  cell_type = "celltype"
+)
+```
+
+## Explore distribution of MS and Control cells
+
+```{r}
+table(obj$group)
+# Control      MS 
+#    5291   61141 
+
+table(obj$group, obj$donor)
+  #         09_034 09_067 11_69 12_002 12_078 13_015 13_047 14_043
+  # Control      0      0  1227   1795      0      0      0   2269
+  # MS       12743   7533     0      0  12764   8356  19745      0
+```
+
+## Save Seurat object
+
+```{r}
+saveRDS(
+  obj,
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_obj.rds")
+)
+
+obj <- readRDS(
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_obj.rds")
+)
+```
+
+# QC and filtering
+
+## QC parameters
+
+```{r}
+#calculate mitochondrial percentage per cell
+obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-")
+
+VlnPlot(
+  obj,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  ncol = 3 
+)
+
+#Low mitchondrial gene expression and other metrics look tight. Data was likely supplied pre-filtered for nFeature <2500 and percent.mt <5. 
+```
+
+## Filter/normalize data
+
+```{r}
+obj <- subset(obj, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+obj <- NormalizeData(obj)
+```
+
+# Dimensionality reduction
+
+## find variable features/scale
+
+```{r}
+obj <- FindVariableFeatures(
+  obj,
+  selection.method = "vst",
+  nfeatures = 3000
+)
+
+obj <- ScaleData(obj)
+```
+
+## PCA
+
+```{r}
+obj <- RunPCA(
+  obj,
+  npcs = 30
+)
+
+ElbowPlot(obj)
+```
+
+# Define clusters
+
+## Cluster cells
+
+```{r}
+obj <- FindNeighbors(
+  obj,
+  dims = 1:15
+)
+
+obj <- FindClusters(
+  obj,
+  resolution = 0.4 #reasonable starting point for current purpose
+)
+```
+
+## UMAP reduction
+
+```{r}
+obj <- RunUMAP(
+  obj,
+  dims = 1:20
+)
+```
+
+## Visualize clusters
+
+```{r}
+DimP_All_Clus <- DimPlot(
+  obj,
+  reduction = "umap",
+  label = TRUE,
+  pt.size = 0.25
+) 
+DimP_All_Clus
+
+#23 clusters were identified
+```
+
+## Plot by  metadata
+
+```{r}
+DimPlot(obj, group.by = "group")
+DimPlot(obj, split.by = "group")
+
+DimPlot(obj, group.by = "donor")
+DimPlot(obj, split.by = "donor")
+
+DimPlot(obj, group.by = "celltype")
+
+#celltype clustering looks clean suggesting clustering worked well
+```
+
+## Define cluster markers
+
+```{r}
+canonical_markers <- list(
+  
+  "Microglia" = c(
+    "AIF1", "HEXB", "P2RY12", "TMEM119", "CX3CR1"
+  ),
+  
+  "Oligodendrocytes" = c(
+    "MBP", "PLP1", "MOG"
+  ),
+  
+  "OPCs" = c(
+    "PDGFRA", "CSPG4"
+  ),
+  
+  "Astrocytes" = c(
+    "GFAP", "AQP4", "ALDH1L1"
+  ),
+  
+  "Neurons" = c(
+    "RBFOX3", "SNAP25", "SYT1"
+  ),
+  
+  "Lymphocytes" = c(
+    "CD3D", "CD79A"
+  ),
+  
+  "Vascular" = c(
+    "CLDN5", "FLT1"
+  )
+)
+
+DotP_All_canonical_markers <- DotPlot(
+  obj,
+  features = canonical_markers
+) +
+  RotatedAxis() +
+  theme(
+    text = element_text(family = "Times"),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+DotP_All_canonical_markers
+
+#Confirms that clus7 has the strongest Mg signature followed by clus21, Clusters 11 and 19 (and they all cluster together). 
+```
+
+```{r}
+canonical_markers <- c(
+  
+  # Microglia
+  "AIF1",
+  "HEXB",
+  "P2RY12",
+  "TMEM119",
+  "CX3CR1",
+  
+  # Oligodendrocytes
+  "MBP",
+  "PLP1",
+  "MOG",
+  
+  # OPC
+  "PDGFRA",
+  "CSPG4",
+  
+  # Astrocytes
+  "GFAP",
+  "AQP4",
+  "ALDH1L1",
+  
+  # Neurons
+  "RBFOX3",
+  "SNAP25",
+  "SYT1",
+  
+  # Lymphocytes
+  "CD3D",
+  "CD79A",
+  
+  # Vascular
+  "CLDN5",
+  "FLT1"
+)
+
+canonical_markers <- canonical_markers[
+  canonical_markers %in% rownames(obj)
+]
+
+FP_All_canonical_markers <- FeaturePlot(
+  obj,
+  features = canonical_markers,
+  reduction = "umap",
+  ncol = 4,
+  pt.size = 0.2
+)
+
+FP_All_canonical_markers
+
+# Also confirms that those clusters contain high expression of Mg markers
+```
+
+```{r}
+DimP_All_og_celltype <- DimPlot(obj, group.by = "celltype")
+DimP_All_og_celltype
+
+DimPlot(obj, split.by = "celltype", group.by = "celltype")
+
+#And when plotting the original cell type identities encoded by the authors of this dataset we see that the clusters in question are annotated as "immune" which is consistent with our assumption that this contains our microglia.
+```
+
+## Save clustered object
+
+```{r}
+saveRDS(
+  obj,
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_obj_clus.rds")
+)
+
+obj <- readRDS(
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_obj_clus.rds")
+)
+```
+
+# Isolate/recluster immune cells
+
+## Isolate immune cell clusters
+```{r}
+immune <- subset(obj, idents = c(7, 11, 19, 21))
+
+table(immune$celltype)#confirms that we did the sub-setting correctly
+
+      # astrocytes           immune      lymphocytes oligodendrocytes 
+      #          1             5415                3                4
+```
+
+## Scale and run PCA
+
+```{r}
+all.genes <- rownames(immune)
+immune<- ScaleData(immune, features = all.genes)
+immune <- RunPCA(immune, features = VariableFeatures(object = immune), npcs = 30)
+```
+
+## Determine PCs
+
+```{r}
+ElbowPlot(immune) 
+```
+
+## Cluster cells
+
+```{r}
+immune<- FindNeighbors(immune, dims = 1:10)
+immune <- FindClusters(immune, resolution = 0.5)
+```
+
+```{r}
+immune <- RunUMAP(immune, dims = 1:10)
+#14 clusters identified
+```
+
+## Plot clusters and explore distribution of cells
+
+```{r}
+DimPlot(immune)
+```
+
+```{r}
+table(immune$group)#good number of cells per group
+table(immune$donor)#one of the donors has low number of cells (11_69 --> 9 cells)
+
+# Control      MS 
+#     287    5136 
+# 
+# 09_034 09_067  11_69 12_002 12_078 13_015 13_047 14_043 
+#    682    471      9    141   1188    495   2300    137 
+```
+
+## Save Seurat object
+```{r}
+saveRDS(
+  immune,
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_immune.rds")
+)
+
+immune <- readRDS(
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_immune.rds")
+)
+```
+# Determine microglial population 
+
+## Plot canonical immune markers by cluster
+
+```{r}
+# Define groups of markers for plot
+immune_glial_markers <- list(
+  
+  "Homeostatic microglia" = c("AIF1", "HEXB", "P2RY12", "TMEM119", "CX3CR1", "SALL1"),
+  
+  "Activated microglia" = c("APOE", "TREM2", "SPP1", "CD68"),
+  
+  "Macrophages" = c("CD163", "MRC1", "MS4A4A", "VSIG4"),
+  
+  "Monocytes" = c("CCR2", "LYZ", "CD14", "S100A8", "S100A9"),
+  
+  "Oligodendrocytes" = c(
+    "MBP", "PLP1", "MOG"
+  ),
+  
+  "OPCs" = c(
+    "PDGFRA", "CSPG4"
+  ),
+  
+  "Astrocytes" = c(
+    "GFAP", "AQP4", "ALDH1L1"
+  )
+)
+
+DotP_ImmuneCells_immune_glial_markers <- DotPlot(
+  immune,
+  features = immune_glial_markers
+) +
+  RotatedAxis() +
+  theme(
+    text = element_text(family = "Times"),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    )
+  )
+
+DotP_ImmuneCells_immune_glial_markers
+```
+
+```{r}
+immune_markers <- c(
+  
+  # --- Microglia (homeostatic) ---
+  "AIF1",
+  "HEXB",
+  "P2RY12",
+  "TMEM119",
+  "CX3CR1",
+  "SALL1",
+  "TREM2",
+  
+  # --- Activated / DAM microglia ---
+  "APOE",
+  "LPL",
+  "SPP1",
+  "CD68",
+  
+  # --- Monocytes / macrophages (infiltrating or tissue-associated) ---
+  "CSF1R",
+  "CCR2",
+  "LYZ",
+  "CD14",
+  
+  # --- M2 / tissue macrophages ---
+  "CD163",
+  "MRC1",
+  "MS4A4A",
+  "VSIG4",
+  
+  # --- Inflammatory monocytes ---
+  "S100A8",
+  "S100A9",
+  
+  # --- T cells ---
+  "CD3D",
+  "CD3E",
+  "CD2",
+  
+  # --- B cells ---
+  "CD79A",
+  "MS4A1",
+  
+  # --- NK cells ---
+  "NKG7",
+  "GNLY"
+)
+
+
+immune_markers <- immune_markers[
+  immune_markers %in% rownames(immune)
+]
+
+FP_ImmuneCells_immune_glial_markers <- FeaturePlot(
+  immune,
+  features = immune_markers,
+  reduction = "umap",
+  ncol = 4,
+  pt.size = 0.2
+)
+
+FP_ImmuneCells_immune_glial_markers
+```
+
+## Find markers for immune cell clusters
+
+```{r}
+markers <- FindAllMarkers(
+  immune,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+#10-15min to run
+```
+
+```{r}
+top10 <- markers %>%
+  group_by(cluster) %>%
+  slice_max(
+    order_by = avg_log2FC,
+    n = 10
+  )
+
+top10
+```
+
+```{r}
+write.csv(markers,
+          file = here("scRNAseq_MS", "outs", "ClusterMarkers_immune.csv"),
+          row.names = FALSE)
+
+markers <- read.csv(here("scRNAseq_MS", "outs", "ClusterMarkers_immune.csv"))
+```
+
+# Isolate microglia cells
+
+```{r}
+micro <- subset(immune, idents = c(0,2,3,4,6,7,9,11))
+micro_cells <- Cells(micro)
+
+table(micro$group)
+table(micro$donor)
+
+#Note: sample 11_69 (a Control) is now filtered out
+```
+## Save Seurat object
+
+```{r}
+saveRDS(
+  micro,
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_micro.rds")
+)
+
+micro <- readRDS(
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_micro.rds")
+)
+```
+
+## Define all other cell types (using prior identification)
+
+```{r}
+obj$cell_population_custom <- "Other cells"
+
+obj$cell_population_custom[obj$celltype == "neurons"] <- "Neurons"
+obj$cell_population_custom[obj$celltype == "opc"] <- "OPCs"
+obj$cell_population_custom[obj$celltype == "oligodendrocytes"] <- "Oligodendrocytes"
+obj$cell_population_custom[obj$celltype == "astrocytes"] <- "Astrocytes"
+obj$cell_population_custom[obj$celltype == "vascular_cells"] <- "Endothelial/vascular cells"
+obj$cell_population_custom[obj$celltype == "lymphocytes"] <- "Other immune cells"
+obj$cell_population_custom[
+  obj$celltype == "immune" & !(colnames(obj) %in% micro_cells)
+] <- "Other immune cells"
+obj$cell_population_custom[
+  colnames(obj) %in% micro_cells
+] <- "Microglia"
+
+obj$cell_population_custom <- factor(
+  obj$cell_population_custom,
+  levels = c(
+    "Neurons",
+    "OPCs",
+    "Oligodendrocytes",
+    "Astrocytes",
+    "Microglia",
+    "Other immune cells",
+    "Endothelial/vascular cells",
+    "Other cells"
+  )
+)
+```
+
+## Plot results
+
+```{r}
+cell_cols <- c(
+  "Neurons" = "#E69F00",
+  "OPCs" = "#0072B2",
+  "Oligodendrocytes" = "#56B4E9",
+  "Astrocytes" = "#009E73",
+  "Microglia" = "#7B1FA2",
+  "Other immune cells" = "#D55E00",
+  "Endothelial/vascular cells" = "#999999",
+  "Other cells" = "gray80"
+)
+
+umap_df <- as.data.frame(Embeddings(obj, "umap"))
+umap_df$group <- obj$group
+umap_df$cell_population_custom <- obj$cell_population_custom
+```
+
+```{r}
+plot_custom_umap <- function(group_name) {
+  
+  df <- subset(umap_df, group == group_name)
+  
+  ggplot(
+    df,
+    aes(
+      x = umap_1,
+      y = umap_2,
+      color = cell_population_custom
+    )
+  ) +
+    geom_point(
+      size = 0.22,
+      alpha = 0.75
+    ) +
+    scale_color_manual(
+      values = cell_cols,
+      name = NULL,
+      drop = FALSE
+    ) +
+    guides(
+      color = guide_legend(
+        override.aes = list(
+          size = 4,
+          alpha = 1
+        )
+      )
+    ) +
+    labs(
+      title = group_name,
+      x = "UMAP 1",
+      y = "UMAP 2"
+    ) +
+    theme_classic() +
+    theme(
+      text = element_text(family = "Times"),
+      legend.position = "right",
+      legend.text = element_text(size = 11),
+      legend.key.size = unit(1.2, "lines"),
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.text = element_text(size = 10, color = "black"),
+      axis.title = element_text(size = 12, color = "black"),
+      axis.line = element_line(linewidth = 0.6, color = "black"),
+      axis.ticks = element_line(linewidth = 0.6, color = "black")
+    )
+}
+```
+
+```{r}
+DimP_All_MS_celltype <- plot_custom_umap("Control")
+DimP_All_Ctrl_celltype <- plot_custom_umap("MS")
+DimP_All_celltype <- plot_custom_umap(c("MS", "Control"))
+
+DimP_All_MS_celltype
+DimP_All_Ctrl_celltype
+DimP_All_celltype
+
+# Selection of microglia is clearly much better! All cluster together. 
+```
+
+# Re-cluster microglial cells
+
+## Find Variable features
+
+```{r}
+micro <- FindVariableFeatures(micro)
+```
+
+## Scale and run PCA
+
+```{r}
+all.genes <- rownames(micro)
+micro<- ScaleData(micro, features = all.genes)
+micro <- RunPCA(micro, features = VariableFeatures(object = micro), npcs = 30)
+```
+
+## Determine PCs
+
+```{r}
+ElbowPlot(micro)
+```
+
+## Cluster and dimensionality reduction
+
+```{r}
+micro<- FindNeighbors(micro, dims = 1:10)
+micro <- FindClusters(micro, resolution = 0.5)
+```
+
+```{r}
+micro <- RunUMAP(micro, dims = 1:10)
+```
+
+## Plot clusters and explore distribution of cells
+
+```{r}
+DimPlot(micro)
+DimPlot(micro, split.by = "group")
+
+table(micro$group)
+table(micro$donor)# one of the donors has low number of cells and became excluded (11_69)
+
+table(micro$donor, micro$seurat_clusters)
+table(micro$group, micro$seurat_clusters)
+table(micro$celltype, micro$seurat_clusters)
+```
+## Save Seurat object
+
+```{r}
+saveRDS(
+  micro,
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_micro_clus.rds")
+)
+
+micro <- readRDS(
+  file = here("scRNAseq_MS", "data", "processed", "Absinta_Seurat_micro_clus.rds")
+)
+```
+
+# Analyze glycolysis in microglia
+
+## Load hallmark gene set
+
+```{r}
+msig_gly <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+) %>%
+  filter(gs_name == "HALLMARK_GLYCOLYSIS")
+
+glycolysis_genes <- unique(msig_gly$gene_symbol)
+
+length(glycolysis_genes)
+head(glycolysis_genes)
+```
+
+## Find matching genes
+
+```{r}
+genes_use <- glycolysis_genes[
+  glycolysis_genes %in% rownames(micro)
+]
+
+length(genes_use)# only 4 genes didn't match dataset
+head(genes_use)
+```
+
+## Add module score
+
+```{r}
+micro <- AddModuleScore(
+  object = micro,
+  features = list(genes_use),
+  name = "Glycolysis"
+)
+
+head(micro@meta.data$Glycolysis1)
+```
+
+## Plot hallmark score
+
+```{r}
+FeaturePlot(
+  micro,
+  features = "Glycolysis1",
+  reduction = "umap"
+) +
+  theme(
+    text = element_text(family = "Times New Roman")
+  )
+```
+
+```{r}
+umap_cols <- rev(viridis::plasma(100))#set color palette
+
+FP_micro_Ctrl_gly <- FeaturePlot(
+  object = subset(micro, subset = group == "Control"),
+  features = "Glycolysis1",
+  reduction = "umap",
+  pt.size = 0.3
+) +
+  scale_color_gradientn(
+    colors = umap_cols,
+    name = "Glycolysis\nscore"
+  ) +
+  ggtitle("Control") +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    plot.title = element_text(hjust = 0.5, size = 16)
+  )
+
+FP_micro_Ctrl_gly
+```
+
+```{r}
+FP_micro_MS_gly <- FeaturePlot(
+  object = subset(micro, subset = group == "MS"),
+  features = "Glycolysis1",
+  reduction = "umap",
+  pt.size = 0.3
+) +
+  scale_color_gradientn(
+    colors = umap_cols,
+    name = "Glycolysis\nscore"
+  ) +
+  ggtitle("MS") +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    plot.title = element_text(hjust = 0.5, size = 16)
+  )
+
+FP_micro_MS_gly
+```
+
+```{r}
+FP_micro_all_gly <- FeaturePlot(
+  object = micro,
+  features = "Glycolysis1",
+  reduction = "umap",
+  pt.size = 0.3
+) +
+  scale_color_gradientn(
+    colors = umap_cols,
+    name = "Glycolysis\nscore"
+  ) +
+  ggtitle("All microglia") +
+  theme(
+    text = element_text(family = "Times New Roman"),
+    plot.title = element_text(hjust = 0.5, size = 16)
+  )
+
+FP_micro_all_gly
+```
+
+# Analyze glycolysis-high microglia
+
+## Bin microglia based on glycolysis score
+
+```{r}
+# define as glycolysis high 65th percentile, glycolysis low 35th percentile (relaxed from 75th/25th due to low numbers of cells in some samples)
+low_thresh  <- quantile(micro@meta.data$Glycolysis1, 0.35, na.rm = TRUE)
+high_thresh <- quantile(micro@meta.data$Glycolysis1, 0.65, na.rm = TRUE)
+
+# Add to object metadata
+micro$gly_state <- case_when(
+  is.na(micro$Glycolysis1) ~ NA_character_,
+  micro$Glycolysis1 >= high_thresh ~ "High",
+  micro$Glycolysis1 <= low_thresh  ~ "Low",
+  TRUE ~ "Mid"
+)
+```
+
+```{r}
+table(micro$donor, micro$gly_state)
+table(micro$seurat_clusters, micro$gly_state)
+table(micro$group, micro$gly_state)
+
+        
+  #        High Low Mid
+  # 09_034  113 299 181
+  # 09_067  174 134 142
+  # 12_002   23  65  48
+  # 12_078  200   8  23
+  # 13_015  128 165 126
+  # 13_047  633 546 555
+  # 14_043   23  77  33
+  #   
+  #    High Low Mid
+  # 0   289 250 299
+  # 1   138 334 182
+  # 2   175 177 163
+  # 3   121 210 166
+  # 4    98 132 103
+  # 5   130  71  86
+  # 6   179   6  15
+  # 7    44  62  55
+  # 8    93   2  15
+  # 9     1  39  13
+  # 10   26  11  11
+  #        
+  #         High  Low  Mid
+  # Control   46  142   81
+  # MS      1248 1152 1027
+```
+
+## Compile donor-level summary data
+
+```{r}
+donor_summary <- micro@meta.data %>%
+  dplyr::select(group, donor, gly_state) %>%
+  dplyr::filter(!is.na(group), !is.na(donor)) %>%
+  dplyr::group_by(donor, group) %>%
+  dplyr::summarise(
+    n_total = n(),
+    n_high  = sum(gly_state == "High", na.rm = TRUE),
+    n_low   = sum(gly_state == "Low",  na.rm = TRUE),
+    pct_high = 100 * n_high / n_total,
+    pct_low  = 100 * n_low  / n_total,
+    .groups = "drop"
+  )
+```
+
+## Calculate donor-level statistics
+
+```{r}
+# donor counts
+n_ctrl <- sum(donor_summary$group == "Control")
+n_ms   <- sum(donor_summary$group == "MS")
+
+# High comparison
+p_high <- if (n_ctrl >= 2 & n_ms >= 2) {
+  wilcox.test(pct_high ~ group, data = donor_summary)$p.value
+} else {
+  NA
+}
+
+mean_high <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(mean = mean(pct_high), .groups = "drop")
+
+diff_high <- 
+  mean_high$mean[mean_high$group == "MS"] -
+  mean_high$mean[mean_high$group == "Control"]
+
+# Low comparison
+p_low <- if (n_ctrl >= 2 & n_ms >= 2) {
+  wilcox.test(pct_low ~ group, data = donor_summary)$p.value
+} else {
+  NA
+}
+
+mean_low <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(mean = mean(pct_low), .groups = "drop")
+
+diff_low <- 
+  mean_low$mean[mean_low$group == "MS"] -
+  mean_low$mean[mean_low$group == "Control"]
+
+#Log fold
+log2fc_high <- log2(
+  (mean_high$mean[mean_high$group == "MS"] + 1e-6) /
+  (mean_high$mean[mean_high$group == "Control"] + 1e-6)
+)
+
+log2fc_low <- log2(
+  (mean_low$mean[mean_low$group == "MS"] + 1e-6) /
+  (mean_low$mean[mean_low$group == "Control"] + 1e-6)
+)
+```
+
+## Plot function
+
+```{r}
+plot_gly_pct <- function(df, y_var, p_val, diff_val, log2fc, title) {
+
+  group_cols <- c("Control" = "blue", "MS" = "#B22222")
+
+  y_max <- max(df[[y_var]], na.rm = TRUE)
+  y_min <- min(df[[y_var]], na.rm = TRUE)
+  y_range <- y_max - y_min
+
+label_txt <- paste0(
+  "nCtrl=", sum(df$group == "Control"),
+  "  nMS=", sum(df$group == "MS"),
+  "\nΔmean=", round(diff_val, 2),
+  "\nlog2FC=", round(log2fc, 2),
+  if (!is.na(p_val)) paste0("\np=", signif(p_val, 2)) else ""
+)
+
+  ggplot(df, aes(x = group, y = .data[[y_var]], color = group)) +
+    geom_boxplot(
+      width = 0.5,
+      outlier.shape = NA,
+      alpha = 0.15,
+      color = "black"
+    ) +
+    geom_quasirandom(
+      width = 0.2,
+      size = 2.5,
+      alpha = 0.85
+    ) +
+    stat_summary(
+      fun = median,
+      geom = "point",
+      size = 3.5,
+      color = "black"
+    ) +
+    scale_color_manual(values = group_cols) +
+    annotate(
+      "text",
+      x = 1.5,
+      y = y_max + 0.12 * y_range,
+      label = label_txt,
+      family = "Times",
+      size = 5
+    ) +
+    labs(
+      title = title,
+      x = NULL,
+      y = "% of cells per donor"
+    ) +
+    coord_cartesian(
+      ylim = c(y_min - 0.05 * y_range, y_max + 0.2 * y_range),
+      clip = "off"
+    ) +
+    theme_classic() +
+    theme(
+      text = element_text(family = "Times"),
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      axis.text = element_text(size = 13, color = "black"),
+      axis.title.y = element_text(size = 14),
+      axis.line = element_line(linewidth = 0.7),
+      axis.ticks = element_line(linewidth = 0.7),
+      plot.margin = margin(10, 15, 25, 10)
+    )
+}
+```
+
+## Plot high/low glycolysis microglia (percent)
+
+```{r}
+PctBoxP_micro_gly_high <- plot_gly_pct(
+  donor_summary,
+  y_var = "pct_high",
+  p_val = p_high,
+  diff_val = diff_high,
+  log2fc = log2fc_high,
+  title = "% Glycolysis-HIGH Microglia per Donor"
+)
+
+PctBoxP_micro_gly_low  <- plot_gly_pct(
+  donor_summary,
+  y_var = "pct_low",
+  p_val = p_low,
+  diff_val = diff_low,
+  log2fc = log2fc_low,
+  title = "% Glycolysis-LOW Microglia per Donor"
+)
+
+PctBoxP_micro_gly_high
+PctBoxP_micro_gly_low
+
+# Note: because we lost 1 control sample during filtering of microglia cells we can no longer use p-values to determine significance as we only have two remaining controls
+```
+
+## Plot as mean glycolysis score (more power)
+
+```{r}
+# Donor level summary (mean score per donor)
+
+donor_summary <- micro@meta.data %>%
+  dplyr::select(group, donor, Glycolysis1) %>%
+  dplyr::filter(!is.na(group), !is.na(donor), !is.na(Glycolysis1)) %>%
+  dplyr::group_by(donor, group) %>%
+  dplyr::summarise(
+    mean_gly = mean(Glycolysis1),
+    .groups = "drop"
+  )
+
+# Statistics
+
+# donor counts
+n_ctrl <- sum(donor_summary$group == "Control")
+n_ms   <- sum(donor_summary$group == "MS")
+
+# Wilcoxon test (note: not reliable if very low n)
+p_val <- if (n_ctrl >= 2 & n_ms >= 2) {
+  wilcox.test(mean_gly ~ group, data = donor_summary)$p.value
+} else {
+  NA
+}
+
+# log2 fold-change
+mean_df <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(mean = mean(mean_gly), .groups = "drop")
+
+diff_mean <-
+  mean_df$mean[mean_df$group == "MS"] -
+  mean_df$mean[mean_df$group == "Control"]
+
+# label
+label_txt <- paste0(
+  "nCtrl=", n_ctrl, "  nMS=", n_ms,
+  "\nΔmean=", round(diff_mean, 3),
+  if (!is.na(p_val)) paste0("\np=", signif(p_val, 2)) else "\np=NA"
+)
+
+# Plot
+
+group_cols <- c("Control" = "blue", "MS" = "#B22222")
+
+y_max <- max(donor_summary$mean_gly, na.rm = TRUE)
+y_min <- min(donor_summary$mean_gly, na.rm = TRUE)
+y_range <- y_max - y_min
+
+BoxP_micro_gly <- ggplot(donor_summary, aes(x = group, y = mean_gly, color = group)) +
+  geom_boxplot(
+    width = 0.5,
+    outlier.shape = NA,
+    alpha = 0.15,
+    color = "black"
+  ) +
+  geom_quasirandom(
+    width = 0.2,
+    size = 2.5,
+    alpha = 0.85
+  ) +
+  stat_summary(
+    fun = median,
+    geom = "point",
+    size = 3.5,
+    color = "black"
+  ) +
+  scale_color_manual(values = group_cols) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = y_max + 0.12 * y_range,
+    label = label_txt,
+    family = "Times",
+    size = 5
+  ) +
+  labs(
+    title = "Mean Glycolysis Score per Donor",
+    x = NULL,
+    y = "Mean Glycolysis1 score"
+  ) +
+  coord_cartesian(
+    ylim = c(y_min - 0.05 * y_range, y_max + 0.2 * y_range),
+    clip = "off"
+  ) +
+      theme_classic() +
+  theme(
+    text = element_text(family = "Times"),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.text = element_text(size = 13, color = "black"),
+    axis.title.y = element_text(size = 14),
+    axis.line = element_line(linewidth = 0.7),
+    axis.ticks = element_line(linewidth = 0.7),
+    plot.margin = margin(10, 15, 25, 10)
+  )
+
+BoxP_micro_gly
+```
+
+# Metabolic genes in MS glycolysis-high vs low microglia
+
+## subset MS microglia
+
+```{r}
+micro_ms <- subset(
+  micro,
+  subset = group == "MS"
+)
+```
+
+## Define metabolic genes
+
+```{r}
+# Define metabolic genes
+genes_dotplot_metabolic <- c(
+  "HK1", "HK2", "PFKP", "GAPDH", "PGK1", "PGAM1",
+  "ENO1", "PKM", "LDHA", "PYGL", "PYGB",
+  "SLC16A1", "SLC16A3", "BSG", "ALDOC",
+  "DDIT4", "HSPA5", "SOD1", "GCLC",
+  "SDHA", "NDUFA1", "NDUFB8", "COX5A", "ATP5F1A"
+)
+
+length(genes_dotplot_metabolic)
+
+genes_dotplot_metabolic <- genes_dotplot_metabolic[
+  genes_dotplot_metabolic %in% rownames(micro_ms)
+]# this just makes sure these genes are present in dataset, based on length before and after filtering looks like we lost one gene
+
+length(genes_dotplot_metabolic)
+```
+
+## Plot metabolic genes
+
+## Plot useing previous gly hi/lo definition
+
+```{r}
+# Ensure proper ordering
+micro_ms$gly_state <- factor(micro_ms$gly_state, levels = c("Low", "Mid", "High"))
+
+# Focus on High vs Low cells
+micro_ms_subset <- subset(micro_ms, subset = gly_state %in% c("Low", "High"))
+
+# Dotplot
+
+DotP_micro_MS_metab_markers <- DotPlot(
+  object = micro_ms_subset,   # OR use micro_ms if keeping Mid
+  features = rev(genes_dotplot_metabolic),
+  group.by = "gly_state",
+  dot.scale = 6,
+  scale = FALSE
+) +
+  coord_flip() +
+  scale_color_gradient(
+    low = "lightgray",
+    high = "red",
+    name = "Average\nExpression"
+  ) +
+  labs(
+    title = "Metabolic Genes in MS Microglia",
+    x = NULL,
+    y = NULL,
+    size = "Percent\nExpressed"
+  ) +
+  theme_classic(base_family = "Times") +
+  theme(
+    text = element_text(family = "Times"),
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text.x = element_text(size = 11, color = "black"),
+    axis.text.y = element_text(size = 12, color = "black"),
+    legend.position = "right",
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    axis.line = element_line(linewidth = 0.7, color = "black"),
+    axis.ticks = element_line(linewidth = 0.7, color = "black")
+  )
+
+DotP_micro_MS_metab_markers
+```
+
+# Percent glycolysis-expressing microglia (by disease)
+
+## Define glycolytic genes
+
+```{r}
+gene_list <- c(
+  "LDHA",
+  "SDHA",
+  "GAPDH",
+  "PGK1",
+  "SLC16A3",
+  "HIF1A",
+  "IL1B"
+)
+
+gene_titles <- c(
+  "LDHA" = "LDHA-positive Microglia",
+  "SDHA" = "SDHA-positive Microglia",
+  "GAPDH" = "GAPDH-positive Microglia",
+  "PGK1" = "PGK1-positive Microglia",
+  "SLC16A3" = "MCT-4-positive Microglia",
+  "HIF1A" = "HIF-1α-positive Microglia",
+  "IL1B" = "IL-1β-positive Microglia"
+)
+```
+
+##Create function for plotting %+ cells ##Updated function
+
+```{r}
+plot_positive_microglia <- function(gene) {
+  
+  # Fetch data
+  
+  df <- FetchData(
+    micro,
+    vars = c(gene, "group", "donor")
+  ) %>%
+    filter(!is.na(group), !is.na(donor))
+  
+  df$group <- factor(df$group, levels = c("Control", "MS"))
+  
+  # Define positive cells
+  ## threshold >0.25 to reduce noise/background
+  
+  df <- df %>%
+    mutate(positive = ifelse(.data[[gene]] > 0.25, 1, 0))
+  
+  # Cell level counts (for visualization)
+  
+  pos_counts <- df %>%
+    group_by(group) %>%
+    summarise(n_positive = sum(positive), .groups = "drop")
+  
+  # Group summary
+  
+  summary_df <- df %>%
+    group_by(group) %>%
+    summarise(
+      percent_positive = mean(positive) * 100,
+      sem = sd(positive * 100) / sqrt(n()),
+      .groups = "drop"
+    )
+  
+  # Donor-level summary (for stats)
+  
+  donor_df <- df %>%
+    group_by(group, donor) %>%
+    summarise(
+      percent_positive = mean(positive) * 100,
+      .groups = "drop"
+    )
+  
+  # Donor counts
+  
+  donor_counts <- donor_df %>%
+    group_by(group) %>%
+    summarise(n_donors = n(), .groups = "drop")
+  
+  # Set colors
+  
+  group_cols <- c(
+    "Control" = "#4A90E2",
+    "MS" = "#D0021B"
+  )
+  
+  # axis limits
+  
+  y_max <- max(c(summary_df$percent_positive + summary_df$sem,
+                 donor_df$percent_positive), na.rm = TRUE)
+  y_lim <- y_max * 1.6
+  
+  # Donor-level statistics
+  
+  n_ctrl <- sum(donor_df$group == "Control")
+  n_ms   <- sum(donor_df$group == "MS")
+  
+  p_value <- if (n_ctrl >= 2 & n_ms >= 2) {
+    wilcox.test(percent_positive ~ group, data = donor_df)$p.value
+  } else {
+    NA
+  }
+  
+  # Log2 fold change with pseudocount
+  
+  mean_df <- donor_df %>%
+    group_by(group) %>%
+    summarise(mean_pct = mean(percent_positive), .groups = "drop")
+  
+  log2fc <- log2(
+    (mean_df$mean_pct[mean_df$group == "MS"] + 1e-6) /
+    (mean_df$mean_pct[mean_df$group == "Control"] + 1e-6)
+  )
+  
+  # Label
+  
+  p_label <- paste0(
+    "p = ", if (!is.na(p_value)) signif(p_value, 3) else "NA",
+    "\nlog2FC = ", round(log2fc, 2)
+  )
+  
+  # PLOT
+  
+  ggplot(summary_df, aes(x = group, y = percent_positive, fill = group)) +
+    
+    geom_col(width = 0.6, color = NA) +
+    
+    geom_errorbar(
+      aes(ymin = percent_positive - sem, ymax = percent_positive + sem),
+      width = 0.18,
+      linewidth = 0.7,
+      color = "black"
+    ) +
+    
+    # plot donor points
+    geom_jitter(
+      data = donor_df,
+      aes(x = group, y = percent_positive),
+      inherit.aes = FALSE,
+      width = 0.08,
+      size = 2.5,
+      color = "black"
+    ) +
+    
+    scale_fill_manual(values = group_cols) +
+    
+    # stats label (p + log2FC)
+    annotate(
+      "text",
+      x = 1.5,
+      y = y_lim * 0.9,
+      label = p_label,
+      family = "Times New Roman",
+      size = 4.5
+    ) +
+    
+    # donor counts 
+    geom_text(
+      data = donor_counts,
+      aes(
+        x = group,
+        y = -y_lim * 0.06,
+        label = paste0("n=", n_donors)
+      ),
+      inherit.aes = FALSE,
+      family = "Times New Roman",
+      size = 4
+    ) +
+    
+    coord_cartesian(ylim = c(-y_lim * 0.1, y_lim), clip = "off") +
+    
+    labs(
+      title = gene_titles[gene],
+      x = NULL,
+      y = paste0("% ", gsub("-positive Microglia", "-positive cells", gene_titles[gene]))
+    ) +
+        theme_classic() +
+    theme(
+      text = element_text(family = "Times New Roman"),
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+      axis.text.x = element_text(size = 12, color = "black"),
+      axis.text.y = element_text(size = 11, color = "black"),
+      axis.title.y = element_text(size = 12, color = "black"),
+      axis.line = element_line(linewidth = 0.7, color = "black"),
+      axis.ticks = element_line(linewidth = 0.7, color = "black"),
+      plot.margin = margin(10, 15, 25, 10)
+    )
+}
+```
+
+##Generate plots
+
+```{r}
+BoxP_micro_pos_LDHA   <- plot_positive_microglia("LDHA")
+BoxP_micro_pos_SDHA   <- plot_positive_microglia("SDHA")
+BoxP_micro_pos_GAPDH  <- plot_positive_microglia("GAPDH")
+BoxP_micro_pos_PGK1   <- plot_positive_microglia("PGK1")
+BoxP_micro_pos_SLC16A3  <- plot_positive_microglia("SLC16A3")
+BoxP_micro_pos_HIF1A  <- plot_positive_microglia("HIF1A")
+BoxP_micro_pos_IL1B  <- plot_positive_microglia("IL1B")
+
+BoxP_micro_pos_LDHA
+BoxP_micro_pos_SDHA
+BoxP_micro_pos_GAPDH
+BoxP_micro_pos_PGK1
+BoxP_micro_pos_SLC16A3
+BoxP_micro_pos_HIF1A
+BoxP_micro_pos_IL1B
+```
+
+# LDHA-associated gene correlation
+
+## Define genes to use
+
+```{r}
+genes_use <- c(
+  "SLC16A3",
+  "PGK1",
+  "LDHA",
+  "ENO1",
+  "NFKBIA",
+  "BSG",
+  "HIF1A",
+  "CXCR4",
+  "GAPDH",
+  "PKM",
+  "IL1B",
+  "SLC16A1",
+  "SDHA",
+  "TNF",
+  "PTGS2"
+)
+```
+
+```{r}
+length(genes_use)
+
+genes_use <- genes_use[
+  genes_use %in% rownames(micro)
+]
+
+genes_use
+length(genes_use)#all genes found in micro cells
+```
+
+## Extract log normalized data
+
+```{r}
+expr_df <- FetchData(
+  object = micro,
+  vars = genes_use,
+  layer = "data"
+)
+```
+
+## Spearman correlation
+
+```{r}
+cor_mat <- cor(
+  expr_df,
+  method = "spearman",
+  use = "pairwise.complete.obs"
+)
+```
+
+##Plot heatmap
+
+```{r}
+CorrP_micro_LDHA <- pheatmap(
+  mat = cor_mat,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  display_numbers = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-0.25, 0.25, length.out = 101),
+  fontsize = 10,
+  fontsize_row = 10,
+  fontsize_col = 10,
+  angle_col = 45,
+  border_color = "grey80",
+  main = "LDHA-Associated Gene Correlation Network in Microglia"
+)
+
+CorrP_micro_LDHA
+```
+
+# IL6-JAK-STAT3 signaling score in Mg (control vs. MS) 
+
+## Define gene set
+
+```{r}
+il6_stat3_genes <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+) %>%
+  filter(gs_name == "HALLMARK_IL6_JAK_STAT3_SIGNALING") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+il6_stat3_genes <- il6_stat3_genes[
+  il6_stat3_genes %in% rownames(micro)
+]
+```
+
+## Add module score
+
+```{r}
+micro <- AddModuleScore(
+  object = micro,
+  features = list(il6_stat3_genes),
+  name = "IL6_STAT3"
+)
+```
+
+```{r}
+# cell-level data
+
+plot_df <- micro@meta.data %>%
+  dplyr::select(group, donor, IL6_STAT31) %>%
+  dplyr::filter(!is.na(group), !is.na(donor), !is.na(IL6_STAT31))
+
+# Donor level summary (mean per donor)
+
+donor_summary <- plot_df %>%
+  dplyr::group_by(donor, group) %>%
+  dplyr::summarise(
+    mean_score = mean(IL6_STAT31),
+    .groups = "drop"
+  )
+
+# group-level summary (median + IQR across donors)
+summary_df <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(
+    median_val = median(mean_score),
+    q1 = quantile(mean_score, 0.25),
+    q3 = quantile(mean_score, 0.75),
+    .groups = "drop"
+  )
+
+# donor counts
+donor_counts <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(n = n(), .groups = "drop")
+
+# donor-level stats
+
+n_ctrl <- sum(donor_summary$group == "Control")
+n_ms   <- sum(donor_summary$group == "MS")
+
+p_val <- if (n_ctrl >= 2 & n_ms >= 2) {
+  wilcox.test(mean_score ~ group, data = donor_summary)$p.value
+} else {
+  NA
+}
+
+mean_df <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(mean = mean(mean_score), .groups = "drop")
+
+diff_mean <- 
+  mean_df$mean[mean_df$group == "MS"] -
+  mean_df$mean[mean_df$group == "Control"]
+
+label_txt <- paste0(
+  "nCtrl=", n_ctrl, "  nMS=", n_ms,
+  "\nΔmean=", round(diff_mean, 3),
+  if (!is.na(p_val)) paste0("\np=", signif(p_val, 2)) else "\np=NA"
+)
+
+# set range
+
+y_max <- max(plot_df$IL6_STAT31, na.rm = TRUE)
+y_min <- min(plot_df$IL6_STAT31, na.rm = TRUE)
+y_range <- y_max - y_min
+
+group_cols <- c("Control" = "blue", "MS" = "#B22222")
+
+# Plot
+
+p_il6_stat3_score <- ggplot(
+  plot_df,
+  aes(x = group, y = IL6_STAT31, color = group)
+) +
+  geom_quasirandom(width = 0.35, size = 0.4, alpha = 0.35) +
+  geom_errorbar(
+    data = summary_df,
+    aes(x = group, ymin = q1, ymax = q3),
+    inherit.aes = FALSE,
+    width = 0.18,
+    color = "black",
+    linewidth = 0.7
+  ) +
+  geom_point(
+    data = summary_df,
+    aes(x = group, y = median_val),
+    inherit.aes = FALSE,
+    color = "black",
+    size = 3
+  ) +
+  scale_color_manual(values = group_cols) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = y_max + 0.08 * y_range,
+    label = label_txt,
+    family = "Times",
+    size = 5
+  ) +
+  geom_text(
+    data = donor_counts,
+    aes(x = group, y = y_min - 0.08 * y_range, label = paste0("n=", n)),
+    inherit.aes = FALSE,
+    family = "Times",
+    size = 4.5
+  ) +
+  coord_cartesian(
+    ylim = c(y_min - 0.12 * y_range, y_max + 0.15 * y_range),
+    clip = "off"
+  ) +
+  labs(
+    title = "IL6–JAK–STAT3 Signaling",
+    x = NULL,
+    y = "Module score"
+  ) +
+      theme_classic() +
+  theme(
+    text = element_text(family = "Times"),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text.x = element_text(size = 13, color = "black"),
+    axis.text.y = element_text(size = 12, color = "black"),
+    axis.title.y = element_text(size = 14, color = "black"),
+    axis.line = element_line(linewidth = 0.7, color = "black"),
+    axis.ticks = element_line(linewidth = 0.7, color = "black")
+  )
+
+p_il6_stat3_score
+```
+
+## Subset IL6-JAK-STAT high Mg and plot %
+
+```{r}
+# Define thresholds
+low_thresh  <- quantile(micro@meta.data$IL6_STAT31, 0.35, na.rm = TRUE)
+high_thresh <- quantile(micro@meta.data$IL6_STAT31, 0.65, na.rm = TRUE)
+
+# Add to object metadata
+micro$il6_state <- case_when(
+  is.na(micro$IL6_STAT31) ~ NA_character_,
+  micro$IL6_STAT31 >= high_thresh ~ "High",
+  micro$IL6_STAT31 <= low_thresh  ~ "Low",
+  TRUE ~ "Mid"
+)
+```
+
+```{r}
+table(micro$donor, micro$il6_state)
+table(micro$seurat_clusters, micro$il6_state)
+table(micro$group, micro$il6_state)
+```
+
+### Donor-level summary
+
+```{r}
+donor_summary <- micro@meta.data %>%
+  dplyr::select(group, donor, il6_state) %>%
+  dplyr::filter(!is.na(group), !is.na(donor)) %>%
+  dplyr::group_by(donor, group) %>%
+  dplyr::summarise(
+    n_total = n(),
+    n_high  = sum(il6_state == "High", na.rm = TRUE),
+    n_low   = sum(il6_state == "Low",  na.rm = TRUE),
+    pct_high = 100 * n_high / n_total,
+    pct_low  = 100 * n_low  / n_total,
+    .groups = "drop"
+  )
+```
+
+### Statistics
+
+```{r}
+# donor counts
+n_ctrl <- sum(donor_summary$group == "Control")
+n_ms   <- sum(donor_summary$group == "MS")
+
+# High comparison
+p_high <- if (n_ctrl >= 2 & n_ms >= 2) {
+  wilcox.test(pct_high ~ group, data = donor_summary)$p.value
+} else {
+  NA
+}
+
+mean_high <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(mean = mean(pct_high), .groups = "drop")
+
+diff_high <- 
+  mean_high$mean[mean_high$group == "MS"] -
+  mean_high$mean[mean_high$group == "Control"]
+
+# Low comparison
+p_low <- if (n_ctrl >= 2 & n_ms >= 2) {
+  wilcox.test(pct_low ~ group, data = donor_summary)$p.value
+} else {
+  NA
+}
+
+mean_low <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(mean = mean(pct_low), .groups = "drop")
+
+diff_low <- 
+  mean_low$mean[mean_low$group == "MS"] -
+  mean_low$mean[mean_low$group == "Control"]
+
+#log2 fold change
+log2fc_high <- log2(
+  (mean_high$mean[mean_high$group == "MS"] + 1e-6) /
+  (mean_high$mean[mean_high$group == "Control"] + 1e-6)
+)
+
+log2fc_low <- log2(
+  (mean_low$mean[mean_low$group == "MS"] + 1e-6) /
+  (mean_low$mean[mean_low$group == "Control"] + 1e-6)
+)
+```
+
+### Plot function
+
+```{r}
+plot_il6_pct <- function(df, y_var, p_val, diff_val, log2fc, title) {
+
+  group_cols <- c("Control" = "blue", "MS" = "#B22222")
+
+  y_max <- max(df[[y_var]], na.rm = TRUE)
+  y_min <- min(df[[y_var]], na.rm = TRUE)
+  y_range <- y_max - y_min
+
+label_txt <- paste0(
+  "nCtrl=", sum(df$group == "Control"),
+  "  nMS=", sum(df$group == "MS"),
+  "\nΔmean=", round(diff_val, 2),
+  "\nlog2FC=", round(log2fc, 2),
+  if (!is.na(p_val)) paste0("\np=", signif(p_val, 2)) else ""
+)
+
+  ggplot(df, aes(x = group, y = .data[[y_var]], color = group)) +
+    geom_boxplot(
+      width = 0.5,
+      outlier.shape = NA,
+      alpha = 0.15,
+      color = "black"
+    ) +
+    geom_quasirandom(
+      width = 0.2,
+      size = 2.5,
+      alpha = 0.85
+    ) +
+    stat_summary(
+      fun = median,
+      geom = "point",
+      size = 3.5,
+      color = "black"
+    ) +
+    scale_color_manual(values = group_cols) +
+    annotate(
+      "text",
+      x = 1.5,
+      y = y_max + 0.12 * y_range,
+      label = label_txt,
+      family = "Times",
+      size = 5
+    ) +
+    labs(
+      title = title,
+      x = NULL,
+      y = "% of cells per donor"
+    ) +
+    coord_cartesian(
+      ylim = c(y_min - 0.05 * y_range, y_max + 0.2 * y_range),
+      clip = "off"
+    ) +
+        theme_classic() +
+    theme(
+      text = element_text(family = "Times"),
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      axis.text = element_text(size = 13, color = "black"),
+      axis.title.y = element_text(size = 14),
+      axis.line = element_line(linewidth = 0.7),
+      axis.ticks = element_line(linewidth = 0.7),
+      plot.margin = margin(10, 15, 25, 10)
+    )
+}
+```
+
+### Plots
+
+```{r}
+PctBoxP_micro_il6_high <- plot_gly_pct(
+  donor_summary,
+  y_var = "pct_high",
+  p_val = p_high,
+  diff_val = diff_high,
+  log2fc = log2fc_high,
+  title = "% IL6-JAK-STAT-HIGH Microglia per Donor"
+)
+
+PctBoxP_micro_il6_low <- plot_gly_pct(
+  donor_summary,
+  y_var = "pct_low",
+  p_val = p_low,
+  diff_val = diff_low,
+  log2fc = log2fc_low,
+  title = "% IL6-JAK-STAT-LOW Microglia per Donor"
+)
+
+PctBoxP_micro_il6_high
+PctBoxP_micro_il6_low
+```
+
+#TNFa-NFkB in Mg (Control vs. MS) 
+
+##Define gene set
+
+```{r}
+tnfa_nfkb_genes <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+) %>%
+  filter(gs_name == "HALLMARK_TNFA_SIGNALING_VIA_NFKB") %>%
+  pull(gene_symbol) %>%
+  unique()
+
+tnfa_nfkb_genes <- tnfa_nfkb_genes[
+  tnfa_nfkb_genes %in% rownames(micro)
+]
+```
+
+##Add score
+
+```{r}
+micro <- AddModuleScore(
+  object = micro,
+  features = list(tnfa_nfkb_genes),
+  name = "TNFA_NFKB"
+)
+```
+
+```{r}
+# Cell-level data
+
+plot_df <- micro@meta.data %>%
+  dplyr::select(group, donor, TNFA_NFKB1) %>%
+  dplyr::filter(!is.na(group), !is.na(donor), !is.na(TNFA_NFKB1))
+
+# Donor-level summary
+
+donor_summary <- plot_df %>%
+  dplyr::group_by(donor, group) %>%
+  dplyr::summarise(
+    mean_score = mean(TNFA_NFKB1),
+    .groups = "drop"
+  )
+
+summary_df <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(
+    median_val = median(mean_score),
+    q1 = quantile(mean_score, 0.25),
+    q3 = quantile(mean_score, 0.75),
+    .groups = "drop"
+  )
+
+donor_counts <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(n = n(), .groups = "drop")
+
+# Statistics
+
+n_ctrl <- sum(donor_summary$group == "Control")
+n_ms   <- sum(donor_summary$group == "MS")
+
+p_val <- if (n_ctrl >= 2 & n_ms >= 2) {
+  wilcox.test(mean_score ~ group, data = donor_summary)$p.value
+} else {
+  NA
+}
+
+mean_df <- donor_summary %>%
+  group_by(group) %>%
+  summarise(mean = mean(mean_score), .groups = "drop")
+
+diff_mean <- 
+  mean_df$mean[mean_df$group == "MS"] -
+  mean_df$mean[mean_df$group == "Control"]
+
+label_txt <- paste0(
+  "nCtrl=", n_ctrl, "  nMS=", n_ms,
+  "\nΔmean=", round(diff_mean, 3),
+  if (!is.na(p_val)) paste0("\np=", signif(p_val, 2)) else "\np=NA"
+)
+
+# Range
+
+y_max <- max(plot_df$TNFA_NFKB1, na.rm = TRUE)
+y_min <- min(plot_df$TNFA_NFKB1, na.rm = TRUE)
+y_range <- y_max - y_min
+
+group_cols <- c("Control" = "blue", "MS" = "#B22222")
+
+# Plot
+
+p_tnfa_nfkb_score <- ggplot(
+  plot_df,
+  aes(x = group, y = TNFA_NFKB1, color = group)
+) +
+  geom_quasirandom(width = 0.35, size = 0.4, alpha = 0.35) +
+  geom_errorbar(
+    data = summary_df,
+    aes(x = group, ymin = q1, ymax = q3),
+    inherit.aes = FALSE,
+    width = 0.18,
+    color = "black",
+    linewidth = 0.7
+  ) +
+  geom_point(
+    data = summary_df,
+    aes(x = group, y = median_val),
+    inherit.aes = FALSE,
+    color = "black",
+    size = 3
+  ) +
+  scale_color_manual(values = group_cols) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = y_max + 0.08 * y_range,
+    label = label_txt,
+    family = "Times",
+    size = 5
+  ) +
+  geom_text(
+    data = donor_counts,
+    aes(x = group, y = y_min - 0.08 * y_range, label = paste0("n=", n)),
+    inherit.aes = FALSE,
+    family = "Times",
+    size = 4.5
+  ) +
+  coord_cartesian(
+    ylim = c(y_min - 0.12 * y_range, y_max + 0.15 * y_range),
+    clip = "off"
+  ) +
+  labs(
+    title = "TNFα–NFκB Signaling",
+    x = NULL,
+    y = "Module score"
+  ) +
+      theme_classic() +
+  theme(
+    text = element_text(family = "Times"),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text.x = element_text(size = 13, color = "black"),
+    axis.text.y = element_text(size = 12, color = "black"),
+    axis.title.y = element_text(size = 14, color = "black"),
+    axis.line = element_line(linewidth = 0.7, color = "black"),
+    axis.ticks = element_line(linewidth = 0.7, color = "black")
+  )
+
+p_tnfa_nfkb_score
+```
+
+## Subset TNFA_NFKB high Mg and plot %
+
+```{r}
+# Define thresholds
+low_thresh  <- quantile(micro@meta.data$TNFA_NFKB1, 0.35, na.rm = TRUE)
+high_thresh <- quantile(micro@meta.data$TNFA_NFKB, 0.65, na.rm = TRUE)
+
+# Add to object metadata
+micro$tnf_state <- case_when(
+  is.na(micro$TNFA_NFKB1) ~ NA_character_,
+  micro$TNFA_NFKB1 >= high_thresh ~ "High",
+  micro$TNFA_NFKB1 <= low_thresh  ~ "Low",
+  TRUE ~ "Mid"
+)
+```
+
+```{r}
+table(micro$donor, micro$tnf_state)
+table(micro$seurat_clusters, micro$tnf_state)
+table(micro$group, micro$tnf_state)
+
+  #        High Low Mid
+  # 09_034   34 378 181
+  # 09_067  129 160 161
+  # 12_002   19  57  60
+  # 12_078  201   6  24
+  # 13_015   42 264 113
+  # 13_047  858 335 541
+  # 14_043   11  94  28
+  #   
+  #    High Low Mid
+  # 0   513  86 239
+  # 1    62 361 231
+  # 2   224 100 191
+  # 3    33 322 142
+  # 4    32 206  95
+  # 5   108  74 105
+  # 6   189   0  11
+  # 7    21  84  56
+  # 8   105   1   4
+  # 9     0  35  18
+  # 10    7  25  16
+  #        
+  #         High  Low  Mid
+  # Control   30  151   88
+  # MS      1264 1143 1020
+```
+
+### Donor-level summary
+
+```{r}
+donor_summary <- micro@meta.data %>%
+  dplyr::select(group, donor, tnf_state) %>%
+  dplyr::filter(!is.na(group), !is.na(donor)) %>%
+  dplyr::group_by(donor, group) %>%
+  dplyr::summarise(
+    n_total = n(),
+    n_high  = sum(tnf_state == "High", na.rm = TRUE),
+    n_low   = sum(tnf_state == "Low",  na.rm = TRUE),
+    pct_high = 100 * n_high / n_total,
+    pct_low  = 100 * n_low  / n_total,
+    .groups = "drop"
+  )
+```
+
+### Statistics
+
+```{r}
+# donor counts
+n_ctrl <- sum(donor_summary$group == "Control")
+n_ms   <- sum(donor_summary$group == "MS")
+
+# High comparison
+p_high <- if (n_ctrl >= 2 & n_ms >= 2) {
+  wilcox.test(pct_high ~ group, data = donor_summary)$p.value
+} else {
+  NA
+}
+
+mean_high <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(mean = mean(pct_high), .groups = "drop")
+
+diff_high <- 
+  mean_high$mean[mean_high$group == "MS"] -
+  mean_high$mean[mean_high$group == "Control"]
+
+# Low comparison
+p_low <- if (n_ctrl >= 2 & n_ms >= 2) {
+  wilcox.test(pct_low ~ group, data = donor_summary)$p.value
+} else {
+  NA
+}
+
+mean_low <- donor_summary %>%
+  dplyr::group_by(group) %>%
+  dplyr::summarise(mean = mean(pct_low), .groups = "drop")
+
+diff_low <- 
+  mean_low$mean[mean_low$group == "MS"] -
+  mean_low$mean[mean_low$group == "Control"]
+
+#log2 fold change
+log2fc_high <- log2(
+  (mean_high$mean[mean_high$group == "MS"] + 1e-6) /
+  (mean_high$mean[mean_high$group == "Control"] + 1e-6)
+)
+
+log2fc_low <- log2(
+  (mean_low$mean[mean_low$group == "MS"] + 1e-6) /
+  (mean_low$mean[mean_low$group == "Control"] + 1e-6)
+)
+```
+
+### Plot function
+
+```{r}
+plot_tnf_pct <- function(df, y_var, p_val, diff_val, log2fc, title) {
+
+  group_cols <- c("Control" = "blue", "MS" = "#B22222")
+
+  y_max <- max(df[[y_var]], na.rm = TRUE)
+  y_min <- min(df[[y_var]], na.rm = TRUE)
+  y_range <- y_max - y_min
+
+label_txt <- paste0(
+  "nCtrl=", sum(df$group == "Control"),
+  "  nMS=", sum(df$group == "MS"),
+  "\nΔmean=", round(diff_val, 2),
+  "\nlog2FC=", round(log2fc, 2),
+  if (!is.na(p_val)) paste0("\np=", signif(p_val, 2)) else ""
+)
+
+  ggplot(df, aes(x = group, y = .data[[y_var]], color = group)) +
+    geom_boxplot(
+      width = 0.5,
+      outlier.shape = NA,
+      alpha = 0.15,
+      color = "black"
+    ) +
+    geom_quasirandom(
+      width = 0.2,
+      size = 2.5,
+      alpha = 0.85
+    ) +
+    stat_summary(
+      fun = median,
+      geom = "point",
+      size = 3.5,
+      color = "black"
+    ) +
+    scale_color_manual(values = group_cols) +
+    annotate(
+      "text",
+      x = 1.5,
+      y = y_max + 0.12 * y_range,
+      label = label_txt,
+      family = "Times",
+      size = 5
+    ) +
+    labs(
+      title = title,
+      x = NULL,
+      y = "% of cells per donor"
+    ) +
+    coord_cartesian(
+      ylim = c(y_min - 0.05 * y_range, y_max + 0.2 * y_range),
+      clip = "off"
+    ) +
+        theme_classic() +
+    theme(
+      text = element_text(family = "Times"),
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+      axis.text = element_text(size = 13, color = "black"),
+      axis.title.y = element_text(size = 14),
+      axis.line = element_line(linewidth = 0.7),
+      axis.ticks = element_line(linewidth = 0.7),
+      plot.margin = margin(10, 15, 25, 10)
+    )
+}
+```
+
+### Plots
+
+```{r}
+PctBoxP_micro_tnf_high <- plot_tnf_pct(
+  donor_summary,
+  y_var = "pct_high",
+  p_val = p_high,
+  diff_val = diff_high,
+  log2fc = log2fc_high,
+  title = "% TNFA-NFKB-HIGH Microglia per Donor"
+)
+
+PctBoxP_micro_tnf_low <- plot_tnf_pct(
+  donor_summary,
+  y_var = "pct_low",
+  p_val = p_low,
+  diff_val = diff_low,
+  log2fc = log2fc_low,
+  title = "% TNFA-NFKB-LOW Microglia per Donor"
+)
+
+PctBoxP_micro_tnf_high
+PctBoxP_micro_tnf_low
+```
+
+# Save figures
+
+## Create function to save multiple figures
+
+```{r}
+save_figures <- function(
+  plot_names,                 # character vector of plot object names
+  figure_save_path,
+  current_date,
+  dataset_tag = NULL,         # e.g. "data2", "replicateB", "v2"
+  sizes = NULL,               # optional named list: list(plot_name = c(w, h))
+  default_size = c(6, 5),
+  units = "in",
+  dpi = 600,
+  ext = "jpg",
+  env = parent.frame()        # environment where plot objects live
+) {
+
+  # ensure output directory exists
+  dir.create(figure_save_path, showWarnings = FALSE, recursive = TRUE)
+
+  # dataset suffix for filenames
+  dataset_suffix <- if (!is.null(dataset_tag)) {
+    paste0("_", dataset_tag)
+  } else {
+    ""
+  }
+
+  for (plot_name in plot_names) {
+
+    # check plot exists
+    if (!exists(plot_name, envir = env)) {
+      warning(paste("Plot object not found:", plot_name))
+      next
+    }
+
+    plot_obj <- get(plot_name, envir = env)
+
+    # optional safety check
+    if (!inherits(plot_obj, "ggplot")) {
+      warning(paste("Object is not a ggplot:", plot_name))
+      next
+    }
+
+    # determine size
+    if (!is.null(sizes) && plot_name %in% names(sizes)) {
+      width  <- sizes[[plot_name]][1]
+      height <- sizes[[plot_name]][2]
+    } else {
+      width  <- default_size[1]
+      height <- default_size[2]
+    }
+
+    # save plot
+    ggsave(
+      filename = file.path(
+        figure_save_path,
+        paste0(current_date, "_", plot_name, dataset_suffix, ".", ext)
+      ),
+      plot = plot_obj,
+      width = width,
+      height = height,
+      units = units,
+      dpi = dpi
+    )
+  }
+}
+```
+
+## Specify date, filepath, etc.
+
+```{r}
+# Date prefix for saved figures
+current_date <-format(Sys.Date(), "%Y-%m-%d")
+
+# Filepath to save to
+figure_save_path <- here("scRNAseq_MS", "outs")
+figure_save_path
+
+# Set dataset tag
+dataset_tag = "" #if no tag to include
+```
+
+## Save all figures of interest
+
+```{r}
+# Define plots to save (object names only)
+plots_to_save <- c(
+"DotP_All_canonical_markers",
+"FP_All_canonical_markers",
+"DimP_All_og_celltype",
+"DotP_All_immune_markers",
+"DotP_ImmuneCells_immune_glial_markers",
+"FP_ImmuneCells_immune_glial_markers",
+"DimP_All_MS_celltype",
+"DimP_All_Ctrl_celltype",
+"DimP_All_celltype",
+"FP_micro_Ctrl_gly",
+"FP_micro_MS_gly",
+"FP_micro_all_gly",
+"PctBoxP_micro_gly_high",
+"PctBoxP_micro_gly_low",
+"BoxP_micro_gly",
+"VlnP_micro_gly_cells",
+"DotP_micro_MS_metab_markers",
+"BoxP_micro_pos_LDHA",
+"BoxP_micro_pos_SDHA",
+"BoxP_micro_pos_GAPDH",
+"BoxP_micro_pos_PGK1",
+"BoxP_micro_pos_SLC16A3",
+"BoxP_micro_pos_HIF1A",
+"BoxP_micro_pos_IL1B",
+"CorrP_micro_LDHA",
+"PctBoxP_micro_il6_high",
+"PctBoxP_micro_il6_low",
+"PctBoxP_micro_tnf_high",
+"PctBoxP_micro_tnf_low"
+)
+
+# Optional: plot-specific sizes (default = (6,5), names must match object names)
+plot_sizes <- list(
+  VlnPlot_glycolysis     = c(5, 4)
+)
+
+# Save figures
+save_figures(
+  plot_names       = plots_to_save,
+  sizes            = plot_sizes,
+  figure_save_path = figure_save_path,
+  current_date     = current_date,
+  dataset_tag      = dataset_tag
+)
+```
+
+## Pheatmap requires special saving parameters input into the plot function
+
+```{r}
+pheatmap(
+  mat = cor_mat,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  display_numbers = FALSE,
+  color = colorRampPalette(c("blue", "white", "red"))(100),
+  breaks = seq(-0.25, 0.25, length.out = 101),
+  fontsize = 10,
+  fontsize_row = 10,
+  fontsize_col = 10,
+  angle_col = 45,
+  border_color = "grey80",
+  main = "LDHA-Associated Gene Correlation Network in Microglia",
+  filename = here("scRNAseq_MS", "outs", "LDHA_network_micro.png"), 
+  width = 8,
+  height = 6
+)
+```

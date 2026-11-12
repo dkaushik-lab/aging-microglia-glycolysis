@@ -1,0 +1,20 @@
+# RStudio
+.Rprofile
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.DS_Store
+
+# renv
+renv/
+renv.lock
+
+# bulk RNA-seq outputs and data
+bulkRNAseq_CHCA/data/
+bulkRNAseq_CHCA/outs/
+
+# scRNA-seq outputs and data
+scRNAseq_MS/data/
+scRNAseq_MS/outs/
+scRNAseq_MS/figure_save_path/
